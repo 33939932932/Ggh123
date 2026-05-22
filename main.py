@@ -5,9 +5,13 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from flask import Flask
 from threading import Thread
 
-TOKEN = "8874295002:AAG1LjCninGU731q-zhuIAKae2bC22PqRZY"
+# ⚠️ SECURITY: Use environment variable instead of hardcoded token
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
+
 OWNER_ID = 866169035 
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, allowed_updates=["message", "callback_query"])
 dp = Dispatcher()
 
 app = Flask(__name__)
@@ -165,7 +169,7 @@ async def sudo(msg: Message):
         async with aiosqlite.connect("bio_game.db") as db:
             await db.execute(f"UPDATE users SET {column} = {column} + ? WHERE id=?", (value, user_id))
             await db.commit()
-        await msg.answer(f"✅ ROOT: {column} +{value} для {user_id}")
+        await msg.answer(f"✅ ROOT: {column} +{value} д��я {user_id}")
     except ValueError:
         await msg.answer("❌ user_id и value должны быть числами")
     except Exception as e:
