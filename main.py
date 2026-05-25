@@ -146,6 +146,20 @@ async def start_web():
     await site.start()
     logger.info(f"Keep-alive на порту {PORT}")
 
+async def vip_expiry_checker():
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    UPDATE players SET is_vip=0
+                    WHERE is_vip=1 AND vip_until IS NOT NULL
+                    AND vip_until < datetime('now')
+                """)
+                await db.commit()
+        except Exception as e:
+            logger.warning(f"VIP expiry check error: {e}")
+
 async def self_ping():
     if not RENDER_URL:
         logger.info("RENDER_EXTERNAL_URL не задан — самопинг отключён")
@@ -401,7 +415,7 @@ async def get_top_players(limit=10):
 
 def is_vip_active(p: dict) -> bool:
     if not p.get("is_vip"): return False
-    if not p.get("vip_until"): return True
+    if not p.get("vip_until"): return False
     try:
         return datetime.datetime.utcnow() < datetime.datetime.fromisoformat(str(p["vip_until"]))
     except Exception:
@@ -833,6 +847,7 @@ def kb_promo_admin():
 
 @router.message(CommandStart())
 @router.message(F.text == ".start")
+@router.message(F.text == ".старт")
 async def cmd_start(msg: Message):
     if await is_banned(msg.from_user.id):
         return await msg.answer("🚫 Вы заблокированы.")
@@ -927,26 +942,24 @@ async def cb_menu_help(cb: CallbackQuery):
     await cb.answer()
     await cb.message.answer(
         "ℹ️ <b>БИО-ВОЙНЫ — Помощь</b>\n\n"
-        "<b>Основные команды (с точкой):</b>\n"
-        ".старт — начать\n"
+        "<b>Команды (с точкой):</b>\n"
+        ".старт — начать / главное меню\n"
         ".лаб — лаборатория\n"
         ".профиль — профиль\n"
         ".заразить @user — атака\n"
         ".лечение — вылечить горячку\n"
         ".топ — топ игроков\n"
         ".топкорп — топ корпораций\n"
-        ".промокод КОД — активировать\n"
-        ".помощь — эта справка\n"
-        ".помощьрп — справка по РП\n\n"
-        "<b>Корпорации:</b>\n"
-        ".создатькорп — создать\n"
+        ".корп — моя корпорация\n"
+        ".создатькорп — создать корп.\n"
         ".вступить ТЕГ — вступить\n"
-        ".выйти — выйти из корпорации\n\n"
+        ".выйти — выйти из корпорации\n"
+        ".промокод КОД — активировать\n"
+        ".помощь — справка\n"
+        ".помощьрп — РП справка\n\n"
         "<b>Прокачка через чат:</b>\n"
-        "+заразность 1 — купить уровень\n"
-        "++заразность 1 — подтвердить покупку\n"
-        "(также: иммунитет, защита, летальность,\n"
-        " учёные, патогены)",
+        "+заразность 2 — показать цену\n"
+        "++заразность 2 — купить",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎭 РП помощь", callback_data="rp_help")],
             [InlineKeyboardButton(text="◀️ Меню", callback_data="back_main")],
@@ -1006,7 +1019,9 @@ async def _show_lab(msg: Message, user=None):
     await msg.answer(_lab_text(p), reply_markup=kb_lab(p))
 
 @router.message(F.text == ".lab")
+@router.message(F.text == ".лаб")
 @router.message(F.text == ".LAB")
+@router.message(F.text == ".ЛАБ")
 @router.message(Command("lab"))
 async def cmd_lab(msg: Message):
     await _show_lab(msg)
@@ -1287,6 +1302,7 @@ async def _send_profile(answer_func, p: dict):
     )
 
 @router.message(F.text == ".profile")
+@router.message(F.text == ".профиль")
 @router.message(Command("profile"))
 async def cmd_profile(msg: Message):
     if await is_banned(msg.from_user.id): return await msg.answer("🚫")
@@ -1298,14 +1314,20 @@ async def cmd_profile(msg: Message):
 #  ВИП
 # ───────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "vip_info")
-async def cb_vip_info(cb: CallbackQuery):
-    uid = cb.from_user.id
+async def _vip_info_text(uid: int) -> str:
+    p   = await get_or_create(uid, None, None)
     p   = await get_player(uid)
     vip = is_vip_active(p)
-    text = (
+    until_str = ""
+    if vip and p.get("vip_until"):
+        try:
+            dt = datetime.datetime.fromisoformat(str(p["vip_until"]))
+            until_str = f"\n⏳ Действует до: <b>{dt.strftime('%d.%m.%Y')}</b>"
+        except Exception:
+            pass
+    return (
         f"⭐ <b>ВИП статус</b>\n\n"
-        f"{'✅ У тебя активен ВИП!' if vip else '❌ ВИП не активен'}\n\n"
+        f"{'✅ У тебя активен ВИП!' if vip else '❌ ВИП не активен'}{until_str}\n\n"
         f"<b>Преимущества ВИП:</b>\n"
         f"🎭 Доступ к 18+ РП командам\n"
         f"⭐ Значок ВИП в профиле и топе\n"
@@ -1313,6 +1335,28 @@ async def cb_vip_info(cb: CallbackQuery):
         f"<b>Стоимость:</b> {VIP_COST_URAN} ☢️ Уран-223\n"
         f"<b>Твой Уран-223:</b> {p['uran']:.1f} ☢️"
     )
+
+@router.message(F.text.lower().in_({".вип инфо", ".vip info", ".вип"}))
+async def cmd_vip_info(msg: Message):
+    if await is_banned(msg.from_user.id): return
+    p   = await get_player(msg.from_user.id)
+    vip = is_vip_active(p)
+    text = await _vip_info_text(msg.from_user.id)
+    await msg.answer(text, reply_markup=kb_vip() if not vip else
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Купить ВИП", callback_data="vip_buy")]
+        ]) if not vip else
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Меню", callback_data="back_main")]
+        ])
+    )
+
+@router.callback_query(F.data == "vip_info")
+async def cb_vip_info(cb: CallbackQuery):
+    uid = cb.from_user.id
+    p   = await get_player(uid)
+    vip = is_vip_active(p)
+    text = await _vip_info_text(uid)
     await cb.message.edit_text(text, reply_markup=kb_vip() if not vip else
         InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_lab")]
@@ -1331,11 +1375,14 @@ async def cb_vip_buy(cb: CallbackQuery):
             f"❌ Нужно {VIP_COST_URAN} ☢️ Уран-223\nУ тебя: {p['uran']:.1f}",
             show_alert=True
         )
-    await update_player(uid, uran=p["uran"] - VIP_COST_URAN, is_vip=1)
+    vip_until = datetime.datetime.utcnow() + datetime.timedelta(days=14)
+    await update_player(uid, uran=p["uran"] - VIP_COST_URAN, is_vip=1,
+                        vip_until=vip_until.isoformat())
     await cb.answer("⭐ ВИП активирован!", show_alert=True)
     await cb.message.edit_text(
         f"⭐ <b>ВИП активирован!</b>\n\n"
         f"Потрачено: <b>{VIP_COST_URAN} ☢️ Уран-223</b>\n"
+        f"⏳ Действует до: <b>{vip_until.strftime('%d.%m.%Y')}</b>\n"
         f"Доступны все 18+ РП команды 🔞\n\n"
         f"Напиши .помощьрп чтобы увидеть все команды",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1376,6 +1423,7 @@ async def cb_menu_rp(cb: CallbackQuery):
 
 @router.callback_query(F.data == "rp_help")
 @router.message(F.text == ".helprp")
+@router.message(F.text == ".помощьрп")
 async def cb_rp_help(event):
     msg = event if isinstance(event, Message) else event.message
     if isinstance(event, CallbackQuery): await event.answer()
@@ -1578,6 +1626,7 @@ async def cmd_infect(msg: Message):
 # ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == ".heal")
+@router.message(F.text == ".лечение")
 @router.message(Command("heal"))
 async def cmd_fever(msg: Message):
     p = await get_or_create(msg.from_user.id, msg.from_user.username, msg.from_user.full_name)
@@ -1618,6 +1667,7 @@ async def cb_fever_wait(cb: CallbackQuery):
 # ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == ".top")
+@router.message(F.text == ".топ")
 @router.message(Command("top"))
 async def cmd_top(msg: Message):
     top    = await get_top_players(10)
@@ -1633,6 +1683,7 @@ async def cmd_top(msg: Message):
     await msg.answer("\n".join(lines) if top else "Топ пуст.")
 
 @router.message(F.text == ".topcorp")
+@router.message(F.text == ".топкорп")
 @router.message(Command("topclans"))
 async def cmd_top_corps(msg: Message):
     top    = await get_top_corps(10)
@@ -1648,6 +1699,7 @@ async def cmd_top_corps(msg: Message):
 # ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == ".createcorp")
+@router.message(F.text == ".создатькорп")
 @router.message(Command("createcorp"))
 @router.callback_query(F.data == "corp_create")
 async def cmd_create_corp(event, state: FSMContext):
@@ -1710,6 +1762,7 @@ async def cmd_join_corp(msg: Message):
     await msg.answer(f"✅ Вступил в <b>[{corp['tag']}] {corp['name']}</b>!")
 
 @router.message(F.text == ".leave")
+@router.message(F.text == ".выйти")
 @router.message(Command("leavecorp"))
 @router.callback_query(F.data == "corp_leave")
 async def cmd_leave_corp(event):
@@ -1751,6 +1804,7 @@ async def cb_corp_search(cb: CallbackQuery):
     await cb.answer()
 
 @router.message(F.text == ".corp")
+@router.message(F.text == ".корп")
 @router.message(Command("corp"))
 async def cmd_corp_menu(msg: Message):
     uid = msg.from_user.id
@@ -1812,8 +1866,9 @@ async def cmd_use_promo(msg: Message):
         await update_player(uid, uran=p["uran"] + reward_amount)
         reward_str = f"+<b>{reward_amount:.0f} ☢️ Уран-223</b>"
     elif reward_type == "vip":
-        await update_player(uid, is_vip=1)
-        reward_str = "<b>⭐ ВИП статус активирован!</b>"
+        vip_until = datetime.datetime.utcnow() + datetime.timedelta(days=14)
+        await update_player(uid, is_vip=1, vip_until=vip_until.isoformat())
+        reward_str = f"<b>⭐ ВИП статус на 14 дней!</b>"
     await msg.answer(
         f"✅ <b>Промокод активирован!</b>\n\n"
         f"🎟 Код: <code>{code}</code>\n"
@@ -1825,6 +1880,7 @@ async def cmd_use_promo(msg: Message):
 # ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == ".help")
+@router.message(F.text == ".помощь")
 @router.message(Command("help"))
 async def cmd_help(msg: Message):
     await msg.answer(
@@ -1859,6 +1915,7 @@ async def _resolve_target_arg(arg: str) -> Optional[dict]:
     return None
 
 @router.message(F.text == ".admin")
+@router.message(F.text == ".админ")
 @router.message(Command("admin"))
 async def cmd_admin(msg: Message):
     uid = msg.from_user.id
@@ -1872,7 +1929,7 @@ async def cmd_admin(msg: Message):
         f"Уровень: <b>{title}</b>\n\n"
         f"📌 Команды:\n"
         f".выдать @user 500 — 🧬 Ресурсы\n"
-        f".выдатьуран @user 100 — ☢️ Уран (только себе ур.9)\n"
+        f".довуран @user 100 — ☢️ Уран (только себе ур.9)\n"
         f".выдатьопыт @user 100 — ☣️ Опыт\n"
         f".выдатьопыткорп ТЕГ 100 — ☣️ Опыт корп.\n"
         f".бан @user причина — 🚫 (ур.4+)\n"
@@ -1929,7 +1986,7 @@ async def cb_adm_give_uran(cb: CallbackQuery):
     uid = cb.from_user.id
     if await get_admin_level(uid) < 9: return await cb.answer("❌ Только Владелец!", show_alert=True)
     await cb.message.edit_text(
-        "☢️ <b>Выдача Уран-223</b>\n\n.выдатьуран @username 100",
+        "☢️ <b>Выдача Уран-223</b>\n\n.довуран @username 100",
         reply_markup=kb_admin_main()
     )
     await cb.answer()
@@ -1948,7 +2005,7 @@ async def cb_adm_help(cb: CallbackQuery):
     if not await is_admin(cb.from_user.id): return await cb.answer("❌", show_alert=True)
     await cb.message.edit_text(
         "📋 <b>Все команды администратора</b>\n\n"
-        ".выдать @user 500\n.выдатьуран @user 100 (ур.9)\n"
+        ".выдать @user 500\n.довуран @user 100 (ур.9)\n"
         ".выдатьопыт @user 100\n.выдатьопыткорп ТЕГ 100\n"
         ".бан @user причина (ур.4+)\n.разбан @user (ур.4+)\n"
         ".повысить @user 1-5 причина (ур.5+)\n"
@@ -1985,13 +2042,13 @@ async def cmd_give(msg: Message):
             await msg.bot.send_message(target["user_id"], f"🎁 +{amount:.0f}🧬\nБаланс: {new_bal:.1f}")
         except Exception: pass
 
-@router.message(F.text.startswith(".выдатьуран"))
+@router.message(F.text.startswith(".довуран"))
 async def cmd_give_uran(msg: Message):
     uid = msg.from_user.id
     if await get_admin_level(uid) < 9:
         return await msg.answer("❌ Только Владелец!")
     parts = msg.text.strip().split()
-    if len(parts) < 3: return await msg.answer("❌ .выдатьуран @user 100")
+    if len(parts) < 3: return await msg.answer("❌ .довуран @user 100")
     target = await _resolve_target_arg(parts[1])
     if not target: return await msg.answer("❌ Не найден.")
     try:
@@ -2155,6 +2212,7 @@ async def cmd_demote(msg: Message):
     except Exception: pass
 
 @router.message(F.text == ".hide")
+@router.message(F.text == ".спрятать")
 async def cmd_hide(msg: Message):
     uid = msg.from_user.id
     if not await is_admin(uid, min_level=2): return
